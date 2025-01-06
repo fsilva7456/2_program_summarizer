@@ -3,8 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from openai import OpenAI
 from supabase import create_client, Client
-from typing import List
 from dotenv import load_dotenv
+from typing import Dict, List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -40,61 +40,110 @@ supabase: Client = create_client(
     os.getenv('SUPABASE_KEY')
 )
 
-class BrandRequest(BaseModel):
-    brand_name: str
+class CompetitorResponse(BaseModel):
+    id: int
+    competitor_name: str
+    program_summary: str | None
 
-def find_competitors(brand_name: str) -> List[str]:
+def get_loyalty_program_summary(competitor_name: str) -> str:
     """
-    Use OpenAI to find 5 competitor brands with loyalty programs
+    Use OpenAI to generate a summary of the competitor's loyalty program
     """
-    logger.info(f"Finding competitors for {brand_name}")
-    prompt = f"""Find 5 major competitors of {brand_name} that have loyalty programs. 
-    Return only the brand names separated by commas, nothing else."""
+    logger.info(f"Generating loyalty program summary for {competitor_name}")
+    prompt = f"""Research and provide a concise summary of {competitor_name}'s loyalty program.
+    Focus on key features like:
+    - Program name
+    - How points are earned
+    - Main benefits and rewards
+    - Special features
+    
+    Provide this with 3 key bullet points and then a single, well-formatted paragraph."""
     
     response = client.chat.completions.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that provides competitor analysis."},
+            {"role": "system", "content": "You are a helpful assistant that researches loyalty programs."},
             {"role": "user", "content": prompt}
         ]
     )
     
-    competitors = response.choices[0].message.content.strip().split(',')
-    return [comp.strip() for comp in competitors]
+    return response.choices[0].message.content.strip()
 
-def insert_competitors(brand_name: str, competitors: List[str]):
+def update_competitor_summary(competitor_id: int, competitor_name: str) -> CompetitorResponse:
     """
-    Insert competitors into Supabase table with both brand_name and competitor_name
+    Update a competitor's row with their loyalty program summary
     """
-    logger.info(f"Inserting competitors for {brand_name}: {competitors}")
-    for competitor in competitors:
-        supabase.table('competitors').insert({
-            'brand_name': brand_name,
-            'competitor_name': competitor
-        }).execute()
+    logger.info(f"Updating summary for competitor ID {competitor_id}: {competitor_name}")
+    summary = get_loyalty_program_summary(competitor_name)
+    
+    response = supabase.table('competitors').update({
+        'program_summary': summary
+    }).eq('id', competitor_id).execute()
+    
+    updated_competitor = response.data[0]
+    logger.info(f"Successfully updated summary for {competitor_name}")
+    
+    return CompetitorResponse(**updated_competitor)
 
 @app.get("/")
 async def root():
     logger.info("Health check endpoint called")
     return {"status": "API is running"}
 
-@app.post("/analyze-competitors")
-async def analyze_competitors(request: BrandRequest):
+@app.post("/update-single/{competitor_id}")
+async def update_single_competitor(competitor_id: int):
+    """
+    Update the loyalty program summary for a single competitor
+    """
     try:
-        logger.info(f"Received request to analyze competitors for {request.brand_name}")
-        if not all([os.getenv('OPENAI_API_KEY'), os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY')]):
-            logger.error("Missing environment variables")
-            raise HTTPException(status_code=500, detail="Missing environment variables")
+        logger.info(f"Received request to update competitor ID: {competitor_id}")
         
-        competitors = find_competitors(request.brand_name)
-        insert_competitors(request.brand_name, competitors)
+        # Get competitor details
+        response = supabase.table('competitors').select('*').eq('id', competitor_id).execute()
         
-        logger.info(f"Successfully processed request for {request.brand_name}")
-        return {
-            "brand_name": request.brand_name,
-            "competitors": competitors,
-            "status": "Data successfully stored in Supabase"
-        }
+        if not response.data:
+            logger.error(f"No competitor found with ID {competitor_id}")
+            raise HTTPException(status_code=404, detail="Competitor not found")
+            
+        competitor = response.data[0]
+        updated_competitor = update_competitor_summary(competitor_id, competitor['competitor_name'])
+        
+        return updated_competitor
+        
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/update-all")
+async def update_all_competitors():
+    """
+    Update loyalty program summaries for all competitors without summaries
+    """
+    try:
+        logger.info("Starting batch update of all competitors")
+        response = supabase.table('competitors').select('id, competitor_name').is_('program_summary', 'null').execute()
+        
+        if not response.data:
+            logger.info("No competitors found needing summary updates")
+            return {"status": "No competitors found needing updates"}
+        
+        logger.info(f"Found {len(response.data)} competitors to process")
+        updated_competitors = []
+        
+        for competitor in response.data:
+            try:
+                updated = update_competitor_summary(competitor['id'], competitor['competitor_name'])
+                updated_competitors.append(updated)
+                logger.info(f"Successfully processed {competitor['competitor_name']}")
+            except Exception as e:
+                logger.error(f"Error processing {competitor['competitor_name']}: {str(e)}")
+        
+        return {
+            "status": "success",
+            "total_processed": len(updated_competitors),
+            "updated_competitors": updated_competitors
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in batch update: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
